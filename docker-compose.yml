@@ -1,0 +1,100 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: td_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pokemon_user
+      POSTGRES_PASSWORD: pokemon_pass
+      POSTGRES_DB: pokemon_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - datalake_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pokemon_user -d pokemon_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: td_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console Web
+    volumes:
+      - minio_data:/data
+    networks:
+      - datalake_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: td_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - datalake_net
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin123;
+        mc mb --ignore-existing local/raw-pokemon;
+        mc mb --ignore-existing local/pokemon-images;
+        mc mb --ignore-existing local/reports;
+        mc anonymous set download local/pokemon-images;
+        echo 'Buckets créés : raw-pokemon, pokemon-images, reports';
+      "
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: td_n8n
+    restart: unless-stopped
+    environment:
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: admin
+      N8N_BASIC_AUTH_PASSWORD: admin123
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: pokemon_db
+      DB_POSTGRESDB_USER: pokemon_user
+      DB_POSTGRESDB_PASSWORD: pokemon_pass
+      DB_POSTGRESDB_SCHEMA: n8n
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      WEBHOOK_URL: http://localhost:5678/
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - datalake_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  minio_data:
+  n8n_data:
+
+networks:
+  datalake_net:
+    driver: bridge

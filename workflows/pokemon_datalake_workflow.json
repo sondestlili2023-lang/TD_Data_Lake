@@ -1,0 +1,128 @@
+{
+  "name": "Pokemon DataLake — Ingestion PokéAPI vers MinIO + PostgreSQL",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 1 }]
+        }
+      },
+      "id": "node-trigger",
+      "name": "Déclencheur (toutes les heures)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const id = Math.floor(Math.random() * 151) + 1;\nreturn [{ json: { pokemon_id: id } }];"
+      },
+      "id": "node-pick-id",
+      "name": "Choisir un Pokémon aléatoire",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://pokeapi.co/api/v2/pokemon/{{ $json.pokemon_id }}",
+        "options": {}
+      },
+      "id": "node-fetch-api",
+      "name": "Appel PokéAPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst payload = {\n  pokemon_id: d.id,\n  name: d.name,\n  height: d.height,\n  weight: d.weight,\n  types: d.types.map(t => t.type.name),\n  sprite_url: d.sprites?.front_default ?? null,\n  base_experience: d.base_experience,\n  stats: d.stats.map(s => ({ name: s.stat.name, value: s.base_stat })),\n  fetched_at: new Date().toISOString()\n};\nconst raw = JSON.stringify(payload, null, 2);\nconst fileName = `${d.name}_${d.id}.json`;\nreturn [{ json: { payload, raw, fileName, pokemon_id: d.id, pokemon_name: d.name } }];"
+      },
+      "id": "node-build-json",
+      "name": "Construire le JSON enrichi",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucketName": "raw-pokemon",
+        "fileName": "={{ $json.fileName }}",
+        "binaryData": false,
+        "fileContent": "={{ $json.raw }}",
+        "additionalFields": {
+          "contentType": "application/json"
+        }
+      },
+      "id": "node-upload-minio",
+      "name": "Upload vers MinIO (raw-pokemon)",
+      "type": "n8n-nodes-base.s3",
+      "typeVersion": 1,
+      "position": [1120, 300],
+      "credentials": {
+        "s3": { "id": "cred-minio", "name": "MinIO S3" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO pokemons (name, pokeapi_id, types, height, weight, sprite_url)\nSELECT\n  '{{ $('Construire le JSON enrichi').item.json.pokemon_name }}',\n  {{ $('Construire le JSON enrichi').item.json.pokemon_id }},\n  ARRAY['{{ $('Construire le JSON enrichi').item.json.payload.types.join(\"','\") }}']::text[],\n  {{ $('Construire le JSON enrichi').item.json.payload.height }},\n  {{ $('Construire le JSON enrichi').item.json.payload.weight }},\n  '{{ $('Construire le JSON enrichi').item.json.payload.sprite_url }}'\nON CONFLICT (name) DO UPDATE SET\n  height = EXCLUDED.height,\n  weight = EXCLUDED.weight,\n  sprite_url = EXCLUDED.sprite_url\nRETURNING pokemon_id;",
+        "options": {}
+      },
+      "id": "node-upsert-pokemon",
+      "name": "Upsert Pokémon dans PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1340, 180],
+      "credentials": {
+        "postgres": { "id": "cred-postgres", "name": "Postgres account" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO pokemon_files (\n    pokemon_id, bucket_name, object_key, file_name, file_type, mime_type, file_size\n  )\n  SELECT\n    p.pokemon_id,\n    'raw-pokemon',\n    '{{ $('Construire le JSON enrichi').item.json.fileName }}',\n    '{{ $('Construire le JSON enrichi').item.json.fileName }}',\n    'json',\n    'application/json',\n    {{ $('Construire le JSON enrichi').item.json.raw.length }}\n  FROM pokemons p\n  WHERE p.pokeapi_id = {{ $('Construire le JSON enrichi').item.json.pokemon_id }}\n  RETURNING file_id\n)\nINSERT INTO file_ingestion_log (\n  file_name, bucket_name, object_key, source, status, file_size, file_id\n)\nSELECT\n  '{{ $('Construire le JSON enrichi').item.json.fileName }}',\n  'raw-pokemon',\n  '{{ $('Construire le JSON enrichi').item.json.fileName }}',\n  'pokeapi',\n  'success',\n  {{ $('Construire le JSON enrichi').item.json.raw.length }},\n  file_id\nFROM ins;",
+        "options": {}
+      },
+      "id": "node-insert-meta",
+      "name": "Enregistrer les métadonnées",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1340, 420],
+      "credentials": {
+        "postgres": { "id": "cred-postgres", "name": "Postgres account" }
+      }
+    }
+  ],
+  "connections": {
+    "Déclencheur (toutes les heures)": {
+      "main": [[{ "node": "Choisir un Pokémon aléatoire", "type": "main", "index": 0 }]]
+    },
+    "Choisir un Pokémon aléatoire": {
+      "main": [[{ "node": "Appel PokéAPI", "type": "main", "index": 0 }]]
+    },
+    "Appel PokéAPI": {
+      "main": [[{ "node": "Construire le JSON enrichi", "type": "main", "index": 0 }]]
+    },
+    "Construire le JSON enrichi": {
+      "main": [[{ "node": "Upload vers MinIO (raw-pokemon)", "type": "main", "index": 0 }]]
+    },
+    "Upload vers MinIO (raw-pokemon)": {
+      "main": [
+        [{ "node": "Upsert Pokémon dans PostgreSQL", "type": "main", "index": 0 }],
+        [{ "node": "Enregistrer les métadonnées", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert Pokémon dans PostgreSQL": {
+      "main": [[{ "node": "Enregistrer les métadonnées", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "description": "Récupère un Pokémon aléatoire depuis la PokéAPI, stocke le JSON brut dans MinIO (bucket raw-pokemon) via le nœud S3 natif, upsert le Pokémon dans PostgreSQL, et trace chaque ingestion dans file_ingestion_log."
+  }
+}
